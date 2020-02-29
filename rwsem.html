@@ -1,0 +1,137 @@
+<!doctype HTML><html><head><meta charset="utf-8"><title>Song's Doc: rwsem</title>
+<link rel="stylesheet" href="http://cdnjs.cloudflare.com/ajax/libs/highlight.js/8.1/styles/github.min.css">
+<style type='text/css'>body,table tr{background-color:#fff;font-size:14px}table tr td,table tr th{border:1px solid #ccc;
+padding:6px 13px;
+margin:0}pre code,table,table tr{padding:0}hr,pre code{background:0 0}body{font-family:Noto Serif CJK SC,truetype;
+line-height:1.4;
+color:#333;
+word-wrap:break-word;
+padding:10px 15px}strong,table tr th{font-weight:700}h1{font-size:2em;
+margin:.67em 0;
+text-align:center}h2{font-size:1.75em}h3{font-size:1.5em}h4{font-size:1.25em}h5,h6{font-size:1.1em}h1,h2,h3,h4,h5,h6{font-weight:700;
+position:relative;
+margin-top:15px;
+margin-bottom:15px;
+line-height:1.1}h1,h2{border-bottom:1px solid #eee}hr{height:0;
+margin:15px 0;
+overflow:hidden;
+border:0;
+border-bottom:1px solid #ddd}a{color:#4183C4}a.absent{color:#c00}ol,ul{padding-left:15px;
+margin-left:5px}ol{list-style-type:decimal}table tr{border-top:1px solid #ccc;
+margin:0}table tr:nth-child(2n){background-color:#ccc}table tr td :first-child,table tr th :first-child{margin-top:0}table tr td:last-child,table tr th :last-child{margin-bottom:0}img{max-width:100%}blockquote{padding:0 15px;
+border-left:4px solid #ccc}code,tt{margin:0 2px;
+padding:0 5px;
+white-space:nowrap;
+border:1px solid #eaeaea;
+background-color:#f8f8f8;
+border-radius:3px}pre code{margin:0;
+white-space:pre;
+border:none}.highlight pre,pre{background-color:#f8f8f8;
+border:1px solid #ccc;
+font-size:13px;
+line-height:19px;
+overflow:auto;
+padding:6px 10px;
+border-radius:3px}
+
+#watermark {
+  color: #d0d0d0;
+  font-size: 40px;
+  -webkit-transform: rotate(-60deg);
+  -moz-transform: rotate(-60deg);
+  position: absolute;
+  min-width: 80%;
+  min-height: 80%;
+  margin: 0;
+  z-index: 0;
+  left:100px;
+  top:200px;
+  text-align: center;
+  }
+
+footer {
+      font-size: 18px;
+      color: #f00;
+      text-align: center;
+}
+</style> </head>
+<body id='MathPreviewF'>
+
+<h2 id="read-write-semaphore">Read-Write Semaphore</h2>
+<h3 id="rw_semaphore">rw_semaphore</h3>
+<p>rw_semaphore有原子计数器以及rtmutex共同实现，其中：</p>
+<ul>
+<li>
+<p>原始计数器reader用来记录当前锁的持有者状态，具体为：</p>
+<ul>
+<li>如果reader被设置READER_BIAS位，说明当前锁对于读者可用</li>
+<li>如果reader被设置为WRITER_BIAS，说明当前锁被写者持有</li>
+<li>如果reader大于0(READER_BIAS，WRITER_BIAS都没有设置)，属于中间状态，说明写者已经获取mutex，尝试获取锁，但是此时依然有读者在使用锁</li>
+</ul>
+</li>
+<li>
+<p>mutex仅仅被用来作为等待队列的管理以及实现相应的优先级继承</p>
+</li>
+</ul>
+<pre><code class="c"> 1  #define READER_BIAS     (1U &lt;&lt; 31)
+ 2  #define WRITER_BIAS     (1U &lt;&lt; 30)
+ 3  
+ 4  struct rw_semaphore {
+ 5      atomic_t        readers;
+ 6      struct rt_mutex     rtmutex;
+ 7  #ifdef CONFIG_DEBUG_LOCK_ALLOC
+ 8      struct lockdep_map  dep_map;
+ 9  #endif
+10  };</code></pre>
+
+<h3 id="downup">down/up流程</h3>
+<p><img alt="" src="/home/songsy/work/04.kernel/10.rt_linux/notes/v3/rwsem.png" /></p>
+<p><strong>down_read</strong></p>
+<p>当一个进程尝试获取read锁时：</p>
+<ul>
+<li>通过原子操作判断reader计数器是否设置了READER_BIAS，如果设置了则通过增加计数器引用快速获取锁</li>
+<li>获取rtmutex.wait_lock</li>
+<li>检查reader原子计数器是否被设置成WRITER_BIAS，如果没有，说明尝试获取写锁的进程还没有完成，则可以使该进程继续持有读锁</li>
+<li>如果reader计数器被设置成WRITER_BIAS，说明有进程已经成功获取写锁<ul>
+<li>尝试获取mutex，通过此方式将该进程加入到写进程持有的mutex的waiter队列中</li>
+<li>当进程成功获取mutex后，说明写进程已经释放锁，此时通过增加增加计数器引用获取锁</li>
+<li>释放mutex(读锁拥有者不需要持有mutex，通过释放mutex可以唤醒继续在mutex waiter队列中的其他reader或者writer)</li>
+</ul>
+</li>
+</ul>
+<p><strong>up_read</strong></p>
+<ul>
+<li>通过原子操作判断reader计数器是否设置了READER_BIAS，如果设置了则通过减少计数器引用快速释放锁</li>
+<li>否则说明有进程在等待获取写锁，此时该已经持有mutex，通过唤醒mutex owner来唤醒等待写的进程</li>
+</ul>
+<p><strong>down_write</strong></p>
+<ul>
+<li>尝试获取rtmutex</li>
+<li>清除reader计数器中的READER_BIAS，强制后续读进程获取者进程slowpath操作</li>
+<li>让出cpu，等待所有的读进程完成锁的使用(此过程中可能会有新的reader加入)</li>
+<li>当所有的读进程都完成对锁的使用时，通过设置reader计数器为WRITER_BIAS来获取写锁</li>
+</ul>
+<p><strong>up_write</strong></p>
+<ul>
+<li>清除reader计数器的WRITER_BIAS标志</li>
+<li>并设置其READER_BIAS，这样后续的读进程可以通过fastpath获取读锁</li>
+<li>释放mutex，同时唤醒mutex的等待者</li>
+</ul>
+<h3 id="_1">总结说明：</h3>
+<ul>
+<li>reader持有锁，不是通过mutex，而是通过原子计数器;</li>
+<li>当reader在持有锁的时候，writer需要等待，此时writer已经获取了mutex，但是通过while循环等到reader计数器减少为0<ul>
+<li>此时reader可以继续加入</li>
+<li>writer不能boost reader</li>
+<li>readers不具有优先级继承</li>
+</ul>
+</li>
+<li>当writer持有锁的时候，同时会持有mutex，后面加入的reader会在mutex队列中等待，writer具有优先级继承特性，reader进程会boost writer进程</li>
+</ul>
+
+<script src="http://cdnjs.cloudflare.com/ajax/libs/highlight.js/8.1/highlight.min.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script type="text/javascript" src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/2.7.5/MathJax.js?config=TeX-AMS-MML_HTMLorMML"></script>
+<script type="text/javascript">MathJax.Hub.Config({"showProcessingMessages" : false,"messageStyle" : "none","tex2jax": { inlineMath: [ [ "$", "$" ] ] }});</script>
+</body>
+</html>

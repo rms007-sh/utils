@@ -1,0 +1,284 @@
+<!doctype HTML><html><head><meta charset="utf-8"><title>Song's Doc: spinlock</title>
+<link rel="stylesheet" href="http://cdnjs.cloudflare.com/ajax/libs/highlight.js/8.1/styles/github.min.css">
+<style type='text/css'>body,table tr{background-color:#fff;font-size:14px}table tr td,table tr th{border:1px solid #ccc;
+padding:6px 13px;
+margin:0}pre code,table,table tr{padding:0}hr,pre code{background:0 0}body{font-family:Noto Serif CJK SC,truetype;
+line-height:1.4;
+color:#333;
+word-wrap:break-word;
+padding:10px 15px}strong,table tr th{font-weight:700}h1{font-size:2em;
+margin:.67em 0;
+text-align:center}h2{font-size:1.75em}h3{font-size:1.5em}h4{font-size:1.25em}h5,h6{font-size:1.1em}h1,h2,h3,h4,h5,h6{font-weight:700;
+position:relative;
+margin-top:15px;
+margin-bottom:15px;
+line-height:1.1}h1,h2{border-bottom:1px solid #eee}hr{height:0;
+margin:15px 0;
+overflow:hidden;
+border:0;
+border-bottom:1px solid #ddd}a{color:#4183C4}a.absent{color:#c00}ol,ul{padding-left:15px;
+margin-left:5px}ol{list-style-type:decimal}table tr{border-top:1px solid #ccc;
+margin:0}table tr:nth-child(2n){background-color:#ccc}table tr td :first-child,table tr th :first-child{margin-top:0}table tr td:last-child,table tr th :last-child{margin-bottom:0}img{max-width:100%}blockquote{padding:0 15px;
+border-left:4px solid #ccc}code,tt{margin:0 2px;
+padding:0 5px;
+white-space:nowrap;
+border:1px solid #eaeaea;
+background-color:#f8f8f8;
+border-radius:3px}pre code{margin:0;
+white-space:pre;
+border:none}.highlight pre,pre{background-color:#f8f8f8;
+border:1px solid #ccc;
+font-size:13px;
+line-height:19px;
+overflow:auto;
+padding:6px 10px;
+border-radius:3px}
+
+#watermark {
+  color: #d0d0d0;
+  font-size: 40px;
+  -webkit-transform: rotate(-60deg);
+  -moz-transform: rotate(-60deg);
+  position: absolute;
+  min-width: 80%;
+  min-height: 80%;
+  margin: 0;
+  z-index: 0;
+  left:100px;
+  top:200px;
+  text-align: center;
+  }
+
+footer {
+      font-size: 18px;
+      color: #f00;
+      text-align: center;
+}
+</style> </head>
+<body id='MathPreviewF'>
+
+<h2 id="spinlock">Spinlock</h2>
+<p>在使能了PREEMPT RT的linux内核中，spinlock被重新基于rtmutex实现为可以睡眠的版本</p>
+<h3 id="spinlock_t">spinlock_t定义</h3>
+<ul>
+<li>从spinlock_t定义看，其实spinlok就是封装了一个rt_mutex</li>
+<li>增加的break_lock字段目前没有用到</li>
+</ul>
+<pre><code class="c"> 1  /*
+ 2   * PREEMPT_RT: spinlocks - an RT mutex plus lock-break field:
+ 3   */
+ 4  typedef struct spinlock {
+ 5      struct rt_mutex     lock;
+ 6      unsigned int        break_lock;
+ 7  #ifdef CONFIG_DEBUG_LOCK_ALLOC
+ 8      struct lockdep_map  dep_map;
+ 9  #endif
+10  } spinlock_t;</code></pre>
+
+<h3 id="rt_spin_lock">rt_spin_lock流程</h3>
+<p>对rt spinlock锁的获取其实就是对其封装的rt_mutex的获取，所以其流程与rt_mutex_lock流程类似，主要包括：</p>
+<ul>
+<li><font color="blue">通过调用migrate_disable禁止获取spinlock的进程进行cpu间的迁移</font></li>
+<li>当spinlock/mutex没有其他waiter的时候，通过cmpxchg实现对锁的快速获取(fastpath lock)</li>
+<li>如果spinlock/mutex还有其他的waiter，那么通过被mutex-&gt;wait_lock保护的slow path流程，完成对该spinlock/mutex的获取操作：<ul>
+<li>构建当前task对应该mutex的rt_mutex_waiter，<font color="blue">因为spinlock需要保持进程的状态，所以会设置rt_mutex_waiter中的savestate标志，表示该waiter在等待的过程中需要保持进程原有的状态</font></li>
+<li>需要获取mutex-&gt;wait_lock</li>
+<li><font color="blue">将进程当前的状态备份保存task_struct-&gt;saved_state，并设置task状态为TASK_UNINTERRUPTIBLE</font></li>
+<li>通过函数rt_mutex_enqueue将waiter加入到rt-mutex的waiter红黑树中，根据当前task的优先级情况，可能会更新mutex的top waiter</li>
+<li>因为当前task即将block在该mutex上，所以将waiter同时记录到task的pi_blocked_on中</li>
+<li>判断mutex的top waiter是否有改变，如果top waiter发生改变，那么将就的top waiter从mutex owner的PI waiter红黑树中删除，同时将新的top waiter加入到mutex owner的PI waiter红黑树中</li>
+<li>调用rt_mutex_adjust_prio根据新的top waiter更新mutex owner的优先级</li>
+<li>如果mutex的owner被block在其他mutex上，那么需要调用rt_mutex_adjust_prio_chain更新其所在的PI chain中后续的mutex的top waiter以及task的优先级，实现整个PI chain的优先级继承</li>
+<li>因为已经将该task加入到mutex的wait list中，后续会通过睡眠-唤醒-尝试获取mutex的循环流程直到该task获取的mutex<ul>
+<li>释放wait_lock，并让出CPU，这样其他task可以尝试获取mutex；mutex owner可以通过slowlock流程释放mutex</li>
+<li>当task被唤醒的时候，说明该task是mutex的top waiter，会尝试获取mutex</li>
+<li>会将该task的waiter从mutex的waiter list中删除</li>
+<li>因为task已经获取到了mutex，所以如果mutex继续有其他的waiter，会将其他的top waiter加入到该task的PI waitr红黑树中，因为该task是mutex之前的top waiter，所以不需要尝试根据mutex新的top waiter调整自身优先级</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<p><strong>Migration Disabling</strong></p>
+<p>默认情况下当进程获取到spinlock的时候，系统会禁止该进程在不同cpu之间迁移的功能，即将该进程固定在当前cpu上运行</p>
+<ul>
+<li>
+<p>进程的migration disable/enable设计比较简单：在task_struct结构中增加migrate_disable计数器用来记录该进程的migration状态，通过增加和减少该计数器来标识该进程是否运行migration</p>
+<ul>
+<li>如果task_struct-&gt;migrate_disable不为0，说明该进程已经被禁用migration，那么内核在为该进程选择cpu运行的时候，其查询到的可用的cpu就只有task当前所属的cpu</li>
+</ul>
+</li>
+<li>
+<p>当某个特定的task被设置为migration disabled的时候，需要同时设置该task当前所在的cpu不允许被unplug</p>
+</li>
+<li>
+<p>spinlock禁止进程迁移，是指当进程成功获取到某个spinlock以后，该进程被绑定到获取spinlock时所在的cpu上；在获取spinlock的过程中，如果发生调度进行等待，那么进程是运行被迁移的</p>
+</li>
+<li>
+<p>rt_spin_lock默认会进程其拥有者进程的migration；同时也提供了允许迁移的接口rt_spin_lock__no_mg/rt_spin_unlock__no_mg，会在locallock中被用到</p>
+</li>
+</ul>
+<pre><code class="c"> 1  void migrate_disable(void)
+ 2  {
+ 3      struct task_struct *p = current;
+ 4  
+ 5      ... ...
+ 6      if (p-&gt;migrate_disable) {
+ 7          p-&gt;migrate_disable++;
+ 8          return;
+ 9      }
+10  
+11      preempt_disable();
+12      preempt_lazy_disable();
+13      pin_current_cpu();
+14      p-&gt;migrate_disable = 1;
+15      preempt_enable();
+16  }</code></pre>
+
+<p><strong>进程状态保持</strong></p>
+<p>在标准内核中，由于spinlock是通过忙等来完成对锁的获取的，进程在获取spinlock的过程中不会改变其进程的运行状态；在RT实现中，由于spinlock获取进程会睡眠，当spinlock可用的时候，会被唤醒，所以进程在获取到spinlock锁后，其状态有可能会被改变(进程因为spinlock可用被唤醒后，其状态总是会被设置为RUNNING)，rt spinlock通过以下方式实现获取spinlock前后进程状态的保持功能：</p>
+<ul>
+<li>
+<p>task_struct结构中增加saved_state字段用来保存，进程在获取spinlock之前的状态</p>
+</li>
+<li>
+<p>由于spinlock底层是由rt-mutex实现的，所以进程通过设置rt_mutex_waiter的savestate标识当前等待锁的进程需要保持进程状态</p>
+</li>
+<li>
+<p>在进程尝试获取rtmutex之前，系统会将其状态保存在task_struct-&gt;saved_state</p>
+</li>
+<li>
+<p>在进程等待rtmutex的时候，如果有其他进程尝试唤醒该进程，那么只会将task_struct-&gt;saved_state更新为RUNNING，并不会真正唤醒进程</p>
+</li>
+</ul>
+<pre><code class="c"> 1  if (!(p-&gt;state &amp; state)) {
+ 2          /*
+ 3           * The task might be running due to a spinlock sleeper
+ 4           * wakeup. Check the saved state and set it to running
+ 5           * if the wakeup condition is true.
+ 6           */
+ 7          if (!(wake_flags &amp; WF_LOCK_SLEEPER)) {
+ 8              if (p-&gt;saved_state &amp; state) {
+ 9                  p-&gt;saved_state = TASK_RUNNING;
+10                  success = 1;
+11              }
+12          }
+13          goto out;
+14      }</code></pre>
+
+<ul>
+<li>当rtmutex可用，进程获取到spinlock以后，其会根据task_struct-&gt;saved_state将进程恢复到获取spinlock之前的状态</li>
+</ul>
+<pre><code class="c"> 1  /*
+ 2       * Restore the task state to current-&gt;saved_state. We set it
+ 3       * to the original state above and the try_to_wake_up() code
+ 4       * has possibly updated it when a real (non-rtmutex) wakeup
+ 5       * happened while we were blocked. Clear saved_state so
+ 6       * try_to_wakeup() does not get confused.
+ 7       */
+ 8      raw_spin_lock(&amp;self-&gt;pi_lock);
+ 9      __set_current_state_no_track(self-&gt;saved_state);
+10      self-&gt;saved_state = TASK_RUNNING;
+11      raw_spin_unlock(&amp;self-&gt;pi_lock);</code></pre>
+
+<h3 id="rt_spin_unlock">rt_spin_unlock流程</h3>
+<p>fastunlock：</p>
+<ul>
+<li>与rtmutex类似，spinlock也实现了基于原子操作cmpxchg的fastunlock机制前提是mutex没有其他waiter</li>
+</ul>
+<p>slowunlock：</p>
+<ul>
+<li>slowunlock流程是在wait_lock锁保护下完成的</li>
+<li><font color="blue">如果检测到rtmutex当前没有waiter，那么通过将其owner设置为NULL完成锁释放操作</font></li>
+<li>如果rtmutex还有其他waiter：<ul>
+<li>获取mutex当前的top waiter，并且该top waiter从该进程的PI waiter list中删除，因为该task即将释放mutex</li>
+<li>根据task新的PI waiter list调整task的进程优先级</li>
+<li>将mutex的owner设置为(void *)RT_MUTEX_HAS_WAITERS(即使该mutex没有waiter也不能直接将owner设置为NULL)</li>
+<li>调用rt_mutex_postunlock唤醒top waiter</li>
+</ul>
+</li>
+</ul>
+<p><strong>注：</strong></p>
+<p>slowunlock在检测到rtmutex没有waiter时候，通过将其owner设置为NULL完成锁释放操作，会不会引入问题：</p>
+<pre><code class="c"> 1  /*
+ 2       * We must be careful here if the fast path is enabled. If we
+ 3       * have no waiters queued we cannot set owner to NULL here
+ 4       * because of:
+ 5       *
+ 6       * foo-&gt;lock-&gt;owner = NULL;
+ 7       *          rtmutex_lock(foo-&gt;lock);   &lt;- fast path
+ 8       *          free = atomic_dec_and_test(foo-&gt;refcnt);
+ 9       *          rtmutex_unlock(foo-&gt;lock); &lt;- fast path
+10       *          if (free)
+11       *              kfree(foo);
+12       * raw_spin_unlock(foo-&gt;lock-&gt;wait_lock);
+13       *
+14       */</code></pre>
+
+<h3 id="spinlock_1">spinlock主要功能</h3>
+<p>基于rt-mutex实现的spinlock主要功能特点包括：</p>
+<ul>
+<li>
+<p>可以进入睡眠：</p>
+<ul>
+<li>进程在获取spinlock的过程中，会进入睡眠</li>
+<li>获取到spinlock的进程在运行过程中可以被调度，可以睡眠</li>
+<li>要求spinlock的操作在进程上下文</li>
+<li>不能中断禁用/抢占禁用的场景获取spinlock</li>
+</ul>
+</li>
+<li>
+<p>进程获取或者持有spinlock的时候都会保持系统中断开启状态；原来设计中会对irq进行操作的接口，新实现中也不会操作中断</p>
+</li>
+</ul>
+<pre><code class="c"> 1  #define spin_lock_irq(lock)     spin_lock(lock)
+ 2  
+ 3  #define spin_lock_irqsave(lock, flags)           \
+ 4      do {                         \
+ 5          typecheck(unsigned long, flags);     \
+ 6          flags = 0;               \
+ 7          spin_lock(lock);             \
+ 8      } while (0)
+ 9  
+10  #define spin_unlock_irq(lock)       spin_unlock(lock)
+11  
+12  #define spin_unlock_irqrestore(lock, flags)     \
+13      do {                        \
+14          typecheck(unsigned long, flags);    \
+15          (void) flags;               \
+16          spin_unlock(lock);          \
+17      } while (0)</code></pre>
+
+<ul>
+<li>
+<p>保持系统可抢占功能</p>
+</li>
+<li>
+<p>获取spinlock的进程不能进行CPU间的迁移</p>
+</li>
+</ul>
+<h3 id="trylock-issue">trylock issue</h3>
+<pre><code class="c">1  again:
+2      spin_lock(&amp;a);
+3      ... ...
+4      if (!spin_trylock(&amp;b)) {
+5          spin_unlock(&amp;a);
+6          goto again;
+7      }</code></pre>
+
+<p>如果上述运行上述代码的进程具有更高的优先级，spinlock b被同CPU上一个较低优先级的进程持有，那么就会出现死锁，解决方法为：</p>
+<pre><code class="c">1  again:
+2      spin_lock(&amp;a);
+3      ... ...
+4      if (!spin_trylock(&amp;b)) {
+5          spin_unlock(&amp;a);
+6          cpu_chill();
+7          goto again;
+8      }</code></pre>
+
+<script src="http://cdnjs.cloudflare.com/ajax/libs/highlight.js/8.1/highlight.min.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script type="text/javascript" src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/2.7.5/MathJax.js?config=TeX-AMS-MML_HTMLorMML"></script>
+<script type="text/javascript">MathJax.Hub.Config({"showProcessingMessages" : false,"messageStyle" : "none","tex2jax": { inlineMath: [ [ "$", "$" ] ] }});</script>
+</body>
+</html>

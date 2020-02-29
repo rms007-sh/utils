@@ -1,0 +1,302 @@
+<!doctype HTML><html><head><meta charset="utf-8"><title>Song's Doc: rtmutex</title>
+<link rel="stylesheet" href="http://cdnjs.cloudflare.com/ajax/libs/highlight.js/8.1/styles/github.min.css">
+<style type='text/css'>body,table tr{background-color:#fff;font-size:14px}table tr td,table tr th{border:1px solid #ccc;
+padding:6px 13px;
+margin:0}pre code,table,table tr{padding:0}hr,pre code{background:0 0}body{font-family:Noto Serif CJK SC,truetype;
+line-height:1.4;
+color:#333;
+word-wrap:break-word;
+padding:10px 15px}strong,table tr th{font-weight:700}h1{font-size:2em;
+margin:.67em 0;
+text-align:center}h2{font-size:1.75em}h3{font-size:1.5em}h4{font-size:1.25em}h5,h6{font-size:1.1em}h1,h2,h3,h4,h5,h6{font-weight:700;
+position:relative;
+margin-top:15px;
+margin-bottom:15px;
+line-height:1.1}h1,h2{border-bottom:1px solid #eee}hr{height:0;
+margin:15px 0;
+overflow:hidden;
+border:0;
+border-bottom:1px solid #ddd}a{color:#4183C4}a.absent{color:#c00}ol,ul{padding-left:15px;
+margin-left:5px}ol{list-style-type:decimal}table tr{border-top:1px solid #ccc;
+margin:0}table tr:nth-child(2n){background-color:#ccc}table tr td :first-child,table tr th :first-child{margin-top:0}table tr td:last-child,table tr th :last-child{margin-bottom:0}img{max-width:100%}blockquote{padding:0 15px;
+border-left:4px solid #ccc}code,tt{margin:0 2px;
+padding:0 5px;
+white-space:nowrap;
+border:1px solid #eaeaea;
+background-color:#f8f8f8;
+border-radius:3px}pre code{margin:0;
+white-space:pre;
+border:none}.highlight pre,pre{background-color:#f8f8f8;
+border:1px solid #ccc;
+font-size:13px;
+line-height:19px;
+overflow:auto;
+padding:6px 10px;
+border-radius:3px}
+
+#watermark {
+  color: #d0d0d0;
+  font-size: 40px;
+  -webkit-transform: rotate(-60deg);
+  -moz-transform: rotate(-60deg);
+  position: absolute;
+  min-width: 80%;
+  min-height: 80%;
+  margin: 0;
+  z-index: 0;
+  left:100px;
+  top:200px;
+  text-align: center;
+  }
+
+footer {
+      font-size: 18px;
+      color: #f00;
+      text-align: center;
+}
+</style> </head>
+<body id='MathPreviewF'>
+
+<h2 id="rt-mutex">RT-Mutex</h2>
+<p>rt-mutex其实就是实现了优先级继承(priority inheritance)的mutex，内核中的rt-mutex主要是为了对pthread_mutex_t优先级继承属性的支持；在标准内核中，使用rt-mutex的场景并不多(i2c驱动)，主要还是使用mutex。</p>
+<p>在PREEMPT RT内核中，rt-mutex是内核锁的基础，其他类似spinlock，mutex，rwsem，rwlock等都被修改成通过rt-mutex实现的方式。</p>
+<h3 id="_1">优先级反转</h3>
+<p><img alt="Priority Inversion" src="/home/songsy/work/04.kernel/10.rt_linux/notes/v3/priority-inversion.png" /></p>
+<p>在上图中：</p>
+<ol>
+<li>具有最低优先级的进程L，首先开始运行</li>
+<li>进程A获取竞争资源</li>
+<li>具有最高优先级的进程H通过抢占L开始运行</li>
+<li>具有中间优先级的进程M准备运行，但是由于优先级比较低(相对H)，暂时还没有机会获取CPU</li>
+<li>进程H需要获取竞争资源，但是由于该资源已经被进程L获取，所以其被阻塞，让出CPU；由于进程H让出CPU，进程M有机会进行运行</li>
+<li>直到进程M运行到其主动让出CPU，进程L才有机会获取CPU进行运行</li>
+<li>进程L释放竞争资源，进程H成功获取到资源，并通过抢占进行运行</li>
+</ol>
+<p>在上述5-6过程中，由于竞争资源被L获取，虽然进程H具有最高的优先级，但是其实相当于被比其优先级低的M进程抢占，而且该抢占过程所持续的长度是不可预期的，需要等到进程M主要让出CPU才能完成，就是所谓的<strong>Unbounded Priority Inversion</strong></p>
+<h3 id="priority-inheritance">优先级继承(Priority Inheritance)</h3>
+<p>rt-mutex通过实现优先级继承来解决上面的优先级反转问题：</p>
+<p><img alt="Priority Inheritance" src="/home/songsy/work/04.kernel/10.rt_linux/notes/v3/priority-inheritance.png" /></p>
+<p>在上图5-6过程中，系统检测到优先级更高的进程H希望获取到低优先级L所拥有的竞争资源，此时如果将进程L的优先级提升至进程H的水平上(即让进程L继承其所拥有的竞争资源的等待者H的优先级)，那么进程L就不会被M抢占，而是通过抢占M进程进行运行，并在合适的时候将竞争资源释放给进程H(当进程L释放竞争资源后，其将被设置原来所被设置的进程优先级)</p>
+<h3 id="_2">实现方式</h3>
+<p><strong>PI chain</strong></p>
+<p>对于优先级继承，每当有锁竞争发生时，都需要考虑锁的拥有者是否需要根据其等待者进行优先级的调整和传递；当有多个锁并存的时候，就会出现以这些锁为中间节点的多个进程之间的潜在的优先级传递的链路，以下是内核文档中的例子：</p>
+<pre><code> 1  Process:  A, B, C, D, E
+ 2  Mutexes:  L1, L2, L3, L4
+ 3  
+ 4  A owns: L1
+ 5          B blocked on L1
+ 6          B owns L2
+ 7                 C blocked on L2
+ 8                 C owns L3
+ 9                        D blocked on L3
+10                        D owns L4
+11                               E blocked on L4
+12  
+13  E=&gt;L4-&gt;D=&gt;L3-&gt;C=&gt;L2-&gt;B=&gt;L1-&gt;A</code></pre>
+
+<p>由于会出现多个进程等待同一个锁以及同一个进程拥有多个锁的情况，所以多个PI chain可以被合并到一起：</p>
+<pre><code>1  E=&gt;L4-&gt;D=&gt;L3-&gt;C=+
+2                  |
+3                  +-&gt;L2-+
+4                  |     |
+5                G=+     +-&gt;B=&gt;L1-&gt;A
+6                        |
+7                  F=&gt;L5-+</code></pre>
+
+<ul>
+<li>因为对于一个进程只会被block在某个特定的锁上，所以PI chain最终会收敛到某个特定的进程上</li>
+<li>优先级继承保证了PI chain上每个锁的拥有者的优先级都必须高于或者等于其等待者</li>
+</ul>
+<p><strong>struct rt_mutex</strong></p>
+<pre><code class="c"> 1  /**
+ 2   * The rt_mutex structure
+ 3   *
+ 4   * @wait_lock:  spinlock to protect the structure
+ 5   * @waiters:    rbtree root to enqueue waiters in priority order
+ 6   * @waiters_leftmost: top waiter
+ 7   * @owner:  the mutex owner
+ 8   */
+ 9  struct rt_mutex {
+10      raw_spinlock_t      wait_lock;
+11      struct rb_root          waiters;
+12      struct rb_node          *waiters_leftmost;
+13      struct task_struct  *owner;
+14      int         save_state;
+15  #ifdef CONFIG_DEBUG_RT_MUTEXES
+16      const char      *name, *file;
+17      int         line;
+18      void            *magic;
+19  #endif
+20  };</code></pre>
+
+<p>rt_mutex主要需要记录两个信息：</p>
+<ul>
+<li>拥有者：<ul>
+<li>owner记录着拥有者的task_struct地址；如果owner为NULL，说明该rt_mutex当前可用</li>
+<li>task_struct地址是以偶对齐，其最低bit0为作为是否拥有等待者的标志，优化快速获取锁</li>
+</ul>
+</li>
+<li>所有的等待者：<ul>
+<li>通过红黑树跟踪记录所有的等待者，红黑树根据等待者进程优先级进行排序</li>
+<li>waiters_leftmost记录者优先级最高的等待者</li>
+<li>当rt_mutex变为可用时，其会唤醒优先级最高的等待者</li>
+</ul>
+</li>
+</ul>
+<p><strong>struct rt_mutex_waiter</strong></p>
+<pre><code class="c"> 1  /*
+ 2   * This is the control structure for tasks blocked on a rt_mutex,
+ 3   * which is allocated on the kernel stack on of the blocked task.
+ 4   *
+ 5   * @tree_entry:     pi node to enqueue into the mutex waiters tree
+ 6   * @pi_tree_entry:  pi node to enqueue into the mutex owner waiters tree
+ 7   * @task:       task reference to the blocked task
+ 8   */
+ 9  struct rt_mutex_waiter {
+10      struct rb_node          tree_entry;
+11      struct rb_node          pi_tree_entry;
+12      struct task_struct  *task;
+13      struct rt_mutex     *lock;
+14      bool            savestate;
+15  #ifdef CONFIG_DEBUG_RT_MUTEXES
+16      unsigned long       ip;
+17      struct pid      *deadlock_task_pid;
+18      struct rt_mutex     *deadlock_lock;
+19  #endif
+20      int prio;
+21      u64 deadline;
+22  };</code></pre>
+
+<p>struct rt_mutex_waiter用来记录一个rt_mutex的某个特定等待进程的信息，其主要被用来管理：</p>
+<ul>
+<li>
+<p><strong>Mutex Waiter List</strong>：</p>
+<ul>
+<li>rt_mutex通过记录其所有的rt_mutex_waiter来管理所有block在该rt-mutex上的进程</li>
+<li>每个rt_mutex_waiter都会通过tree_entry被加入到其所对应的rt-muext的waiters红黑树中</li>
+</ul>
+</li>
+<li>
+<p><strong>Task PI Waiter List</strong>：</p>
+<ul>
+<li>为了跟踪PI Chain，每个进程需要管理其所拥有的mutex的等待者的优先级信息；为了实现简单，进程只需要记录其所拥有的mutex的具有最高优先级的等待者(top waiter)</li>
+<li>进程通过红黑树来管理其top waiters</li>
+<li>当某个rt_mutex_waiter是其对应的mutex的top waiter，其会被加入到该mutex的拥有者进程的PI list红黑树中(task_struct-&gt;pi_waiters)</li>
+</ul>
+</li>
+<li>
+<p><strong>Task Blocked-on Mutex</strong>：</p>
+<ul>
+<li>作为PI Chain的一部分，每个task需要记录其所等待的rt-mutex的信息，通过将其所对应的rt_mutex_waiter记录在pi_blocked_on字段来完成</li>
+<li>如果某个task的pi_blocked_on为NULL，说明该task没有等待的rt-mutex，作为rt_mutex_adjust_prio_chain结束的条件</li>
+</ul>
+</li>
+</ul>
+<p><strong>APIs</strong></p>
+<pre><code class="c"> 1  DEFINE_RT_MUTEX(mutexname)
+ 2  rt_mutex_init(mutex)
+ 3  int rt_mutex_is_locked(struct rt_mutex *lock);
+ 4  void rt_mutex_lock(struct rt_mutex *lock);
+ 5  int rt_mutex_lock_state(struct rt_mutex *lock, int state);
+ 6  int rt_mutex_lock_interruptible(struct rt_mutex *lock);
+ 7  int rt_mutex_lock_killable(struct rt_mutex *lock);
+ 8  int rt_mutex_timed_lock(struct rt_mutex *lock, 
+ 9                     struct hrtimer_sleeper *timeout);
+10  int rt_mutex_trylock(struct rt_mutex *lock);
+11  void rt_mutex_unlock(struct rt_mutex *lock);</code></pre>
+
+<p><strong>rt-mutex lock流程</strong></p>
+<p>fastlock：</p>
+<ul>
+<li>rt-mutex实现了基于原子操作cmpxchg的fastlock流程，当锁没有其他waiter的时候，可以通过cmpxchg实现对锁的获取</li>
+<li>rt-mutex的waiter包括：<ul>
+<li>已经被加入到mutex的waiter红黑树中等待mutex可用的task</li>
+<li>正在通过slowpath尝试获取锁，但是还没有被加入到mutex的waiter红黑树中的task</li>
+</ul>
+</li>
+<li>如果rt-mutex有其他waiter，那么需要通过slowlock流程来实现lock流程</li>
+</ul>
+<p>slowlock：</p>
+<ul>
+<li>slowlock流程是需要被rt_mutex的wait_lock进行保护，所以需要获取wait_lock</li>
+<li>task_struct地址是以偶对齐，其最低bit0为作为是否拥有等待者的标志，slowlock流程会首先设置该标志位，以强制使mutex拥有者的unlock流程通过slowpath来完成</li>
+<li>构建当前task对应该mutex的rt_mutex_waiter，因为该当前进程会被block直至获取mutex锁流程完成，所以可以通过栈上的局部变量来构建rt_mutex_waiter</li>
+<li>通过函数rt_mutex_enqueue将waiter加入到rt-mutex的waiter红黑树中，根据当前task的优先级情况，可能会更新mutex的top waiter</li>
+<li>因为当前task即将block在该mutex上，所以将waiter同时记录到task的pi_blocked_on中</li>
+<li>判断mutex的top waiter是否有改变，如果top waiter发生改变，那么将就的top waiter从mutex owner的PI waiter红黑树中删除，同时将新的top waiter加入到mutex owner的PI waiter红黑树中</li>
+<li>调用rt_mutex_adjust_prio根据新的top waiter更新mutex owner的优先级</li>
+<li>如果mutex的owner被block在其他mutex上，那么需要调用rt_mutex_adjust_prio_chain更新其所在的PI chain中后续的mutex的top waiter以及task的优先级，实现整个PI chain的优先级继承</li>
+<li>因为已经将该task加入到mutex的wait list中，后续会通过睡眠-唤醒-尝试获取mutex的循环流程直到该task获取的mutex<ul>
+<li>释放wait_lock，并让出CPU，这样其他task可以尝试获取mutex；mutex owner可以通过slowlock流程释放mutex</li>
+<li>当task被唤醒的时候，说明该task是mutex的top waiter，会尝试获取mutex</li>
+<li>会将该task的waiter从mutex的waiter list中删除</li>
+<li>因为task已经获取到了mutex，所以如果mutex继续有其他的waiter，会将其他的top waiter加入到该task的PI waitr红黑树中，因为该task是mutex之前的top waiter，所以不需要尝试根据mutex新的top waiter调整自身优先级</li>
+</ul>
+</li>
+</ul>
+<p><strong>rt-mutex unlock流程</strong></p>
+<p>fastunlock：</p>
+<ul>
+<li>与fastlock类型，rt-mutex实现了基于原子操作cmpxchg的fastunlock机制</li>
+<li>前提是mutex没有其他waiter，是通过owner的最低位是否为1来标识是否有其他waiter存在</li>
+</ul>
+<p>slowunlock：</p>
+<ul>
+<li>slowunlock流程是在wait_lock锁保护下完成的</li>
+<li>如果当前仅有一个正在还没有被加入的mutex waiter红黑树的waiter，需要等到其被enqueue后才走释放流程</li>
+<li>获取mutex当前的top waiter，并且该top waiter从该进程的PI waiter list中删除，因为该task即将释放mutex</li>
+<li>根据task新的PI waiter list调整task的进程优先级</li>
+<li>将mutex的owner设置为(void *)RT_MUTEX_HAS_WAITERS(即使该mutex没有waiter也不能直接将owner设置为NULL)</li>
+<li>调用rt_mutex_postunlock唤醒top waiter</li>
+</ul>
+<p><font color="blue">注意：</font></p>
+<ul>
+<li>在slowunlock流程中，即使检测到mutex没有waiter也不能直接将owner设置为NULL，代码中举例一种潜在的问题情况，但是rt_spin_unlock是直接设置为NULL</li>
+</ul>
+<pre><code class="c"> 1  /*
+ 2       * We must be careful here if the fast path is enabled. If we
+ 3       * have no waiters queued we cannot set owner to NULL here
+ 4       * because of:
+ 5       *
+ 6       * foo-&gt;lock-&gt;owner = NULL;
+ 7       *          rtmutex_lock(foo-&gt;lock);   &lt;- fast path
+ 8       *          free = atomic_dec_and_test(foo-&gt;refcnt);
+ 9       *          rtmutex_unlock(foo-&gt;lock); &lt;- fast path
+10       *          if (free)
+11       *              kfree(foo);
+12       * raw_spin_unlock(foo-&gt;lock-&gt;wait_lock);
+13       *
+14       * So for the fastpath enabled kernel:
+15       *
+16       * Nothing can set the waiters bit as long as we hold
+17       * lock-&gt;wait_lock. So we do the following sequence:
+18       *
+19       *  owner = rt_mutex_owner(lock);
+20       *  clear_rt_mutex_waiters(lock);
+21       *  raw_spin_unlock(&amp;lock-&gt;wait_lock);
+22       *  if (cmpxchg(&amp;lock-&gt;owner, owner, 0) == owner)
+23       *      return;
+24       *  goto retry;
+25       *
+26       * The fastpath disabled variant is simple as all access to
+27       * lock-&gt;owner is serialized by lock-&gt;wait_lock:
+28       *
+29       *  lock-&gt;owner = NULL;
+30       *  raw_spin_unlock(&amp;lock-&gt;wait_lock);
+31       */</code></pre>
+
+<p><strong>PI chain walk</strong></p>
+<p>PI chain walk是指当PI chain中某个锁的top waiter发生变化的时候，需要根据PI chain，依次更新每个mutex的waiter红黑树以及每个mutex拥有者进程的PI waiter list，并根据PI waiter list调整进程的优先级，实现PI chain的优先级继承，具体由函数rt_mutex_adjust_prio_chain实现，需呀调用rt_mutex_adjust_prio_chain的场景包括：</p>
+<ul>
+<li>当某个mutex有新的waiter加入，并且该waiter具有比mutex原来top waiter更高的优先级</li>
+<li>当某个block在mutex上的进程的优先级发生变化的时候</li>
+</ul>
+<p><strong>rt-mutex lock/unlock流程图</strong></p>
+<p><center><img alt="" src="/home/songsy/work/04.kernel/10.rt_linux/notes/v3/rt_mutex_lock_unlock.png" /></center></p>
+
+<script src="http://cdnjs.cloudflare.com/ajax/libs/highlight.js/8.1/highlight.min.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+<script type="text/javascript" src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/2.7.5/MathJax.js?config=TeX-AMS-MML_HTMLorMML"></script>
+<script type="text/javascript">MathJax.Hub.Config({"showProcessingMessages" : false,"messageStyle" : "none","tex2jax": { inlineMath: [ [ "$", "$" ] ] }});</script>
+</body>
+</html>
